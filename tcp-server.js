@@ -1,20 +1,19 @@
 import net from "net";
+import http from "http";
 
-const allowedLicenses = [
-  "LICENSE_CODE_1",
-  "LICENSE_CODE_2",
-  "LICENSE_CODE_3",
-]; // Replace with your actual license codes. MT5 EA will use one of these to connect to the TCP server.
+const LICENSES = ["LICENSE_CODE_1", "LICENSE_CODE_2", "LICENSE_CODE_3"]; // Replace with your actual license codes. MT5 EA will use one of these to connect to the TCP server.
+const TCP_PORT = 6789; // Port for the TCP server to listen on. MT5 EA will connect to this port.
+const HTTP_PORT = 2345; // Port for the HTTP API server to listen on. Send POST requests to this port to send messages to connected TCP clients.
 
-const tcpPort = 6789; // Port for the TCP server to listen on. MT5 EA will connect to this port. Make sure it's open in your firewall and not used by other applications.
 const clients = new Map();
 let tcpServer = null;
+let httpServer = null;
 
 async function handleConnect(socket, license) {
   try {
     license = license?.trim();
 
-    if (!license || !allowedLicenses.includes(license)) {
+    if (!license || !LICENSES.includes(license)) {
       socket.write("CMD_LICENSE_FAIL\n");
       socket.destroy();
       return;
@@ -158,8 +157,57 @@ async function startTcpServer() {
     console.error("TCP Server error:", err);
   });
 
-  tcpServer.listen(tcpPort, () => {
-    console.log(`TCP Server listening on port ${tcpPort}`);
+  tcpServer.listen(TCP_PORT, () => {
+    console.log(`TCP Server listening on port ${TCP_PORT}`);
+  });
+}
+
+
+async function startHttpServer() {
+  if (httpServer) {
+    return;
+  }
+
+  httpServer = http.createServer((req, res) => {
+    if (req.method === "POST" && req.url === "/send") {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        try {
+          const { license, message } = JSON.parse(body);
+          if (!license || !message) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({ success: false, message: "License and message are required" }));
+          }
+          const socket = clients.get(license);
+          if (socket && socket.writable) {
+            try {
+              socket.write(`${message}\n`);
+            } catch (err) {
+              console.error("Error writing to socket:", err);
+            }
+          } else {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            return res.end(JSON.stringify({ success: false, message: "Client not connected" }));
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: true, message: "Message sent" }));
+        } catch (err) {
+          console.error("Error processing HTTP API request:", err);
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, message: "Invalid JSON" }));
+        }
+      });
+    } else {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, message: "Not found" }));
+    }
+  });
+  httpServer.listen(HTTP_PORT, () => {
+    console.log(`HTTP Server listening on port ${HTTP_PORT}`);
+  });
+  httpServer.on("error", (err) => {
+    console.error("HTTP Server error:", err);
   });
 }
 
@@ -177,6 +225,11 @@ function gracefulShutdown() {
   }
 
   clients.clear();
+
+  if (httpServer) {
+    httpServer.close();
+    httpServer = null;
+  }
 
   if (tcpServer) {
     tcpServer.close(() => {
@@ -198,3 +251,4 @@ process.on("SIGINT", gracefulShutdown);
 process.on("SIGTERM", gracefulShutdown);
 
 startTcpServer();
+startHttpServer();
